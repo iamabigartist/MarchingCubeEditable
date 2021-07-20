@@ -1,0 +1,240 @@
+﻿
+#pragma kernel InitVoxel
+#pragma kernel MarchCube
+#pragma kernel Carve
+
+#include "PointInfo.cginc"
+#include "MarchingCubeFormula.cginc"
+
+int meshtrianglesNum;
+StructuredBuffer<float3> meshVertices;
+StructuredBuffer<int> meshTriangles;
+int toolTriangleNum;
+StructuredBuffer<float3> toolVertices;
+StructuredBuffer<int> toolTriangles;
+
+RWStructuredBuffer<Voxel> voxelBuffer;
+RWStructuredBuffer<PolyInfo> polyBuffer;
+
+#define NO_POLYGON -1
+#define INSIDE 1
+#define OUTSIDE 0
+#define EPSILON 0.00001
+#define IDENTITY float4x4(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)
+
+int voxelNum;
+int cubeNum;
+float3 chunkPos;
+float cubeLength;
+float intensity;
+float3 carvingCenter;
+float3 carvingDir;
+
+float3 Normal(float3 v1, float3 v2, float3 v3) {
+
+	return normalize(cross((v2 - v1), (v3 - v2)));
+}
+float3 Center(float3 v1, float3 v2, float3 v3) {
+
+	return (v1 + v2 + v3) / 3;
+}
+float Dist2Poly(float3 v1, float3 v2, float3 v3, float3 vertex, float3 dir) {
+
+	float3 normal = Normal(v1, v2, v3);
+	if (dot(dir, normal) > 0)
+		return 9999999;
+
+	float3 v21, v31, h, s, q;
+	float a, u, v;
+	v21 = v2 - v1;
+	v31 = v3 - v1;
+	h = cross(dir, v31);
+	a = dot(v21, h);
+	s = vertex - v1;
+	u = dot(s, h) / a;
+	if (u < -EPSILON || u > 1.0 + EPSILON)
+		return 9999999;
+
+	q = cross(s, v21);
+	v = dot(dir, q) / a;
+	if (v < -EPSILON || u + v > 1.0 + EPSILON)
+		return 9999999;
+
+	float t = dot(v31, q) / a;
+	if (t > EPSILON)
+	{
+		return t;
+	}
+	else
+		return 9999999;
+}
+bool CheckInsideObject(StructuredBuffer<float3> vertBuffer, StructuredBuffer<int> triBuffer, int triNum, float4x4 worldMat, uint idx)
+{
+	float closestFrontDist = 999999;
+	float closestBackDist = 999999;
+    for (int i = 0; i < triNum; i += 3)
+    {
+        float3 v1 = mul(worldMat, float4(vertBuffer[triBuffer[i]], 1));
+        float3 v2 = mul(worldMat, float4(vertBuffer[triBuffer[i + 1]], 1));
+        float3 v3 = mul(worldMat, float4(vertBuffer[triBuffer[i + 2]], 1));
+        
+        float curFDist = Dist2Poly(v1, v2, v3, voxelBuffer[idx].pos + chunkPos, float3(0, 1, 0));
+        float curBDist = Dist2Poly(v1, v3, v2, voxelBuffer[idx].pos + chunkPos, float3(0, 1, 0));
+
+		if (curFDist < closestFrontDist) {
+
+			closestFrontDist = curFDist;
+		}
+		if (curBDist < closestBackDist) {
+
+			closestBackDist = curBDist;
+		}
+	}
+    
+	return (closestFrontDist > (closestBackDist + EPSILON));
+}
+
+[numthreads(1024, 1, 1)]
+void InitVoxel(uint3 id : SV_DispatchThreadID) {
+
+    if (id.x >= voxelNum * voxelNum * voxelNum)
+		return;
+
+    // set Position
+    int x = id.x % voxelNum;
+    int y = (id.x % (voxelNum * voxelNum)) / voxelNum;
+    int z = id.x / (voxelNum * voxelNum);
+    float3 firstLocalPos = -(cubeLength * cubeNum) / 2;
+    voxelBuffer[id.x].pos = firstLocalPos + float3(x, y, z) * cubeLength;
+    
+    // check Inside/Outside
+    if (CheckInsideObject(meshVertices, meshTriangles, meshtrianglesNum, IDENTITY,id.x))
+    {
+        voxelBuffer[id.x].value = INSIDE;
+    }
+	else 
+    {
+        voxelBuffer[id.x].value = OUTSIDE;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void MarchCube(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= (cubeNum * cubeNum * cubeNum))
+		return;
+
+    // get Cube Idx
+	int x = id.x % cubeNum;
+	int y = (id.x % (cubeNum*cubeNum)) / cubeNum;
+	int z = id.x / (cubeNum*cubeNum);
+    
+	//  converting formula for cube idx -> vertex idx
+    int v = id.x + y + ((2 * voxelNum) - 1) * z;
+    int v_x = v + 1;
+    int v_xy = v + 1 + voxelNum;
+    int v_y = v + voxelNum;
+    int v_z = v + voxelNum * voxelNum;
+    int v_zx = v_z + 1;
+    int v_zxy = v_z + 1 + voxelNum;
+    int v_zy = v_z + voxelNum;
+    
+    // voxel values (corner)
+	int cornerInfo = 0;
+	if (voxelBuffer[v].value <= 0) { cornerInfo |= 1; }
+	if (voxelBuffer[v_x].value <= 0) { cornerInfo |= 2; }
+	if (voxelBuffer[v_xy].value <= 0) { cornerInfo |= 4; }
+	if (voxelBuffer[v_y].value <= 0) { cornerInfo |= 8; }
+	if (voxelBuffer[v_z].value <= 0) { cornerInfo |= 16; }
+	if (voxelBuffer[v_zx].value <= 0) { cornerInfo |= 32; }
+	if (voxelBuffer[v_zxy].value <= 0) { cornerInfo |= 64; }
+    if (voxelBuffer[v_zy].value <= 0){ cornerInfo |= 128; }
+    
+    // calculate pt between corners
+	float3 vertexPos[12];
+    vertexPos[0] = lerp(voxelBuffer[v].pos,       voxelBuffer[v_x].pos,   0.5f);
+    vertexPos[1] = lerp(voxelBuffer[v_x].pos,     voxelBuffer[v_xy].pos,  0.5f);
+    vertexPos[2] = lerp(voxelBuffer[v_xy].pos,    voxelBuffer[v_y].pos,   0.5f);
+    vertexPos[3] = lerp(voxelBuffer[v_y].pos,     voxelBuffer[v].pos,     0.5f);
+    vertexPos[4] = lerp(voxelBuffer[v_z].pos,     voxelBuffer[v_zx].pos,  0.5f);
+    vertexPos[5] = lerp(voxelBuffer[v_zx].pos,    voxelBuffer[v_zxy].pos, 0.5f);
+    vertexPos[6] = lerp(voxelBuffer[v_zxy].pos,   voxelBuffer[v_zy].pos,  0.5f);
+    vertexPos[7] = lerp(voxelBuffer[v_zy].pos,    voxelBuffer[v_z].pos,   0.5f);
+    vertexPos[8] = lerp(voxelBuffer[v].pos,       voxelBuffer[v_z].pos,   0.5f);
+    vertexPos[9] = lerp(voxelBuffer[v_x].pos,     voxelBuffer[v_zx].pos,  0.5f);
+    vertexPos[10] = lerp(voxelBuffer[v_xy].pos,   voxelBuffer[v_zxy].pos, 0.5f);
+    vertexPos[11] = lerp(voxelBuffer[v_y].pos, voxelBuffer[v_zy].pos, 0.5f);
+
+    
+	// Cleaning
+    polyBuffer[id.x * 5].v1 = 0;
+    polyBuffer[id.x * 5].v2 = 0;
+    polyBuffer[id.x * 5].v3 = 0;
+    polyBuffer[id.x * 5 + 1].v1 = 0;
+    polyBuffer[id.x * 5 + 1].v2 = 0;
+    polyBuffer[id.x * 5 + 1].v3 = 0;
+    polyBuffer[id.x * 5 + 2].v1 = 0;
+    polyBuffer[id.x * 5 + 2].v2 = 0;
+    polyBuffer[id.x * 5 + 2].v3 = 0;
+    polyBuffer[id.x * 5 + 3].v1 = 0;
+    polyBuffer[id.x * 5 + 3].v2 = 0;
+    polyBuffer[id.x * 5 + 3].v3 = 0;
+    polyBuffer[id.x * 5 + 4].v1 = 0;
+    polyBuffer[id.x * 5 + 4].v2 = 0;
+    polyBuffer[id.x * 5 + 4].v3 = 0;
+
+
+    cornerInfo = cornerInfo * 16;
+	int plusIdx = 0;
+    while (LoopUpTable[cornerInfo] != NO_POLYGON)
+    {
+        int edgeInfo[3] =
+        {
+            LoopUpTable[cornerInfo],
+            LoopUpTable[cornerInfo + 1],
+            LoopUpTable[cornerInfo + 2]
+        };
+
+        float3 v1 = vertexPos[edgeInfo[0]];
+        float3 v2 = vertexPos[edgeInfo[1]];
+        float3 v3 = vertexPos[edgeInfo[2]];
+		polyBuffer[(id.x * 5) + plusIdx].v1 = v1;
+		polyBuffer[(id.x * 5) + plusIdx].v2 = v2;
+		polyBuffer[(id.x * 5) + plusIdx].v3 = v3;
+
+		float3 v12 = (v1 - v2);
+		float3 v23 = (v2 - v3);
+		float3 crossNormal = normalize(cross(v12, v23));
+		polyBuffer[(id.x * 5) + plusIdx].facetNormal = crossNormal;
+        
+		++plusIdx;
+        cornerInfo += 3;
+    }
+}
+
+[numthreads(512, 1, 1)]
+void Carve(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (voxelNum * voxelNum * voxelNum))
+		return;
+
+	float3 axisY = carvingDir;
+	float3 axisX;
+	if (dot(axisY, float3(1, 0, 0)) != 1)
+		axisX = float3(1, 0, 0);
+	else
+		axisX = float3(-1, 0, 0);
+	float3 axisZ = normalize(cross(axisX, axisY));
+	axisX = normalize(cross(axisY, axisZ));
+
+	float4x4 worldMat = float4x4(
+		axisX.x, axisY.x, axisZ.x, carvingCenter.x,
+		axisX.y, axisY.y, axisZ.y, carvingCenter.y,
+		axisX.z, axisY.z, axisZ.z, carvingCenter.z,
+		0, 0, 0, 1);
+    
+    if (CheckInsideObject(toolVertices, toolTriangles, toolTriangleNum, worldMat, id.x))
+    {
+        voxelBuffer[id.x].value -= intensity;
+    }
+}
